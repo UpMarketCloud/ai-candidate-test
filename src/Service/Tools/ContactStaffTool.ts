@@ -17,6 +17,7 @@ export class ContactStaffTool {
     private readonly httpService: HttpService,
     private readonly slackService: SlackService,
     private readonly buildEscalatedAnswerTemplate: BuildEscalatedAnswerTemplate,
+    private readonly similarityChecker?: SimilarityChecker,
   ) {
     this.httpService = httpService;
     this.slackService = slackService;
@@ -67,6 +68,7 @@ export class ContactStaffTool {
     priority: '1' | '2' | '3',
     signal?: AbortSignal,
   ): Promise<string> {
+    // Build the canonical escalation payload once so all branches share the same base data.
     const escalationRequest: EscalationRequestDto = {
       conciergeSummary: context,
       guestRequest: query,
@@ -78,6 +80,61 @@ export class ContactStaffTool {
       priority: priority,
     };
 
+    // Fetch existing escalations to make intelligent decisions
+    const existingEscalations = await this.fetchExistingEscalations(
+      request.chatId,
+      request.bookingId,
+      signal,
+    );
+
+    // If there are existing escalations, try to match this request to an existing issue.
+    if (existingEscalations.length > 0 && this.similarityChecker) {
+      const similarityResult = await this.similarityChecker.checkSimilarity(
+        query,
+        existingEscalations,
+      );
+
+      if (similarityResult.isSimilar && similarityResult.matchedEscalationId) {
+        let matchedEscalation = existingEscalations.find(
+          (e) => e.id === similarityResult.matchedEscalationId,
+        );
+
+        if (!matchedEscalation) {
+          // One retry: similarity can return an invalid ID; give it a corrected second attempt.
+          const retrySimilarityResult =
+            await this.similarityChecker.checkSimilarity(
+              query,
+              existingEscalations,
+              {
+                invalidMatchedEscalationId:
+                  similarityResult.matchedEscalationId,
+              },
+            );
+
+          if (
+            retrySimilarityResult.isSimilar &&
+            retrySimilarityResult.matchedEscalationId
+          ) {
+            matchedEscalation = existingEscalations.find(
+              (e) => e.id === retrySimilarityResult.matchedEscalationId,
+            );
+          }
+        }
+
+        if (matchedEscalation) {
+          return this.handleMatchedEscalation(
+            matchedEscalation,
+            escalationRequest,
+            query,
+            context,
+            priority,
+            signal,
+          );
+        }
+      }
+    }
+
+    // No similar match found (or no checker available): create a new escalation.
     const response = await this.reportEscalation(escalationRequest, signal);
 
     if ('failed' in response && response.failed) {
@@ -87,7 +144,6 @@ export class ContactStaffTool {
       });
     }
 
-    // At this point, response is guaranteed to be IncidentResponse
     const incidentResponse = response as IncidentResponse;
 
     const toolResponse: ContactStaffToolResult = {
@@ -107,6 +163,235 @@ export class ContactStaffTool {
     }
 
     return JSON.stringify(toolResponse);
+  }
+
+  private async handleMatchedEscalation(
+    matchedEscalation: ExistingEscalation,
+    escalationRequest: EscalationRequestDto,
+    query: string,
+    context: string,
+    priority: '1' | '2' | '3',
+    signal?: AbortSignal,
+  ): Promise<string> {
+    if (matchedEscalation.status === 'open') {
+      // Existing open escalation: only update when there is new context or higher urgency.
+      const shouldUpgradePriority =
+        this.comparePriority(priority, matchedEscalation.priority) > 0;
+      const hasMeaningfulContextUpdate = this.hasMeaningfulContextUpdate(
+        matchedEscalation.conciergeSummary,
+        context,
+      );
+
+      if (!shouldUpgradePriority && !hasMeaningfulContextUpdate) {
+        // Guest is following up without new actionable details: avoid noisy duplicate updates.
+        const skippedResponse: EscalationSkippedResult = {
+          status: 'skipped',
+          escalationId: matchedEscalation.id,
+          message:
+            'Our team is already working on this issue. We will share updates as soon as possible.',
+        };
+        return JSON.stringify(skippedResponse);
+      }
+
+      const updatePayload: EscalationUpdatePayload = {
+        guestRequest: query,
+        conciergeSummary: `${matchedEscalation.conciergeSummary}\n\n--- Updated context ---\n${context}`,
+      };
+
+      if (shouldUpgradePriority) {
+        updatePayload.priority = priority;
+      }
+
+      const updated = await this.updateEscalation(
+        matchedEscalation.id,
+        updatePayload,
+        signal,
+      );
+
+      if (!updated) {
+        // Update failed, fall back to creating a new escalation
+        return this.fallbackToCreate(escalationRequest, signal);
+      }
+
+      const response: EscalationUpdatedResult = {
+        status: 'updated',
+        escalationId: matchedEscalation.id,
+        message: 'Our team is already looking into this. The escalation has been updated with the new details.',
+      };
+
+      if (shouldUpgradePriority) {
+        response.priorityUpgraded = true;
+        response.message =
+          'Our team is already looking into this. The priority has been upgraded and the escalation updated with the new details.';
+      }
+
+      return JSON.stringify(response);
+    }
+
+    if (matchedEscalation.status === 'resolved') {
+      // Issue resurfaced after resolution: open a new recurring escalation with elevated priority.
+      const escalatedPriority = this.elevatePriority(priority);
+
+      const recurringRequest: EscalationRequestDto = {
+        ...escalationRequest,
+        priority: escalatedPriority,
+        conciergeSummary: `[RECURRING ISSUE — previously resolved as ${matchedEscalation.id}]\n${context}`,
+      };
+
+      const response = await this.reportEscalation(recurringRequest, signal);
+
+      if ('failed' in response && response.failed) {
+        return JSON.stringify({
+          status: 'failed',
+          message: "I'm having trouble reaching staff right now.",
+        });
+      }
+
+      const incidentResponse = response as IncidentResponse;
+
+      return JSON.stringify({
+        status: 'reopened',
+        previousEscalationId: matchedEscalation.id,
+        message:
+          'This issue was previously resolved but has resurfaced. A new escalation has been created with higher priority.',
+        escalationId: incidentResponse.incident?.id,
+        priorityElevated: escalatedPriority !== priority,
+      });
+    }
+
+    // Fallback for any unexpected status
+    return this.fallbackToCreate(escalationRequest, signal);
+  }
+
+  private async fallbackToCreate(
+    escalationRequest: EscalationRequestDto,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const response = await this.reportEscalation(escalationRequest, signal);
+
+    if ('failed' in response && response.failed) {
+      return JSON.stringify({
+        status: 'failed',
+        message: "I'm having trouble reaching staff right now.",
+      });
+    }
+
+    const incidentResponse = response as IncidentResponse;
+
+    const toolResponse: ContactStaffToolResult = {
+      status: 'escalated',
+      messageFromStaff: 'Not confirmed. Need to review.',
+    };
+
+    const staffNote = incidentResponse.incident?.note;
+    const normalizedNote =
+      typeof staffNote === 'string' ? staffNote.trim() : undefined;
+
+    if (normalizedNote) {
+      return JSON.stringify({ ...toolResponse, note: normalizedNote });
+    }
+
+    return JSON.stringify(toolResponse);
+  }
+
+  private async fetchExistingEscalations(
+    chatId: string | undefined,
+    bookingId: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<ExistingEscalation[]> {
+    if (!chatId) {
+      return [];
+    }
+
+    try {
+      const baseUrl = process.env.ADMIN_INSTANCE_URL;
+      const params = new URLSearchParams({ chatId });
+      if (bookingId) {
+        params.append('bookingId', bookingId);
+      }
+      const url = `${baseUrl}api/ai/escalations?${params.toString()}`;
+
+      const httpsAgent = new https.Agent({ rejectUnauthorized: false });
+
+      const response = await firstValueFrom(
+        this.httpService.get(
+          url,
+          buildAdminRequestOptions({ httpsAgent, signal }),
+        ),
+      );
+
+      const data = response.data as ExistingEscalationsResponse;
+      return data.escalations ?? [];
+    } catch (error) {
+      Sentry.captureException(error);
+      // If fetching fails, proceed with creating a new escalation (graceful degradation)
+      return [];
+    }
+  }
+
+  private async updateEscalation(
+    escalationId: string,
+    payload: EscalationUpdatePayload,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    try {
+      const baseUrl = process.env.ADMIN_INSTANCE_URL;
+      const url = `${baseUrl}api/ai/escalations/${escalationId}`;
+      const httpsAgent = new https.Agent({ rejectUnauthorized: false });
+
+      await firstValueFrom(
+        this.httpService.put(
+          url,
+          payload,
+          buildAdminRequestOptions({ httpsAgent, signal }),
+        ),
+      );
+
+      return true;
+    } catch (error) {
+      Sentry.captureException(error);
+      return false;
+    }
+  }
+
+  /**
+   * Compares two priorities. Returns > 0 if `a` is higher priority than `b`.
+   * Priority 1 = HIGH, 2 = NORMAL, 3 = LOW. Lower number = higher priority.
+   */
+  private comparePriority(a: string, b: string): number {
+    return Number(b) - Number(a);
+  }
+
+  /**
+   * Elevates a priority by one level (3 -> 2, 2 -> 1, 1 stays 1).
+   */
+  private elevatePriority(priority: '1' | '2' | '3'): '1' | '2' | '3' {
+    if (priority === '3') return '2';
+    if (priority === '2') return '1';
+    return '1';
+  }
+
+  private hasMeaningfulContextUpdate(
+    existingSummary: string,
+    newContext: string,
+  ): boolean {
+    // Normalize text so casing/spacing differences do not count as meaningful changes.
+    const normalizedExistingSummary = this.normalizeText(existingSummary);
+    const normalizedNewContext = this.normalizeText(newContext);
+
+    if (!normalizedNewContext) {
+      return false;
+    }
+
+    return !normalizedExistingSummary.includes(normalizedNewContext);
+  }
+
+  private normalizeText(value: string | undefined): string {
+    if (!value) {
+      return '';
+    }
+
+    return value.toLowerCase().replace(/\s+/g, ' ').trim();
   }
 
   private async reportEscalation(
@@ -183,10 +468,103 @@ export class ContactStaffTool {
   }
 }
 
+// --- Similarity Checker Interface -------------------------------------------
+
+export const SIMILARITY_PROMPT_TEMPLATE = `You are an issue similarity detector for a hospitality concierge system. Your job is to determine if a new guest complaint is about the same underlying issue as an existing escalation.
+
+Compare the NEW issue with EACH existing escalation (guest issue + escalation summary) and determine if they refer to the same root problem.
+
+Consider these as the SAME issue:
+- Different phrasings of the same problem (e.g., "no hot water" vs "shower is ice cold")
+- Follow-ups or updates about an already reported problem
+- Related symptoms of the same root cause (e.g., "bathroom light flickering" and "electrical problem")
+
+Consider these as DIFFERENT issues:
+- Completely unrelated complaints (e.g., "no hot water" vs "Wi-Fi doesn't work")
+- Issues in different areas/rooms unless clearly connected
+
+NEW ISSUE: {newQuery}
+
+EXISTING ESCALATIONS:
+{existingEscalations}
+
+Respond in valid JSON with the following structure:
+{
+  "isSimilar": boolean,
+  "matchedEscalationId": string | null,
+  "confidence": "high" | "medium" | "low",
+  "reasoning": "brief explanation"
+}
+
+If multiple escalations match, choose the most relevant one (prefer open over resolved, most recent over older).
+Respond ONLY with the JSON object, no additional text.`;
+
+export interface SimilarityChecker {
+  checkSimilarity(
+    newQuery: string,
+    existingEscalations: ExistingEscalation[],
+    options?: SimilarityCheckOptions,
+  ): Promise<SimilarityResult>;
+}
+
+export interface SimilarityCheckOptions {
+  // Used on retry when the first matched ID does not exist in fetched escalations.
+  invalidMatchedEscalationId?: string;
+}
+
+/**
+ * Formats existing escalations for inclusion in the similarity prompt.
+ */
+export function formatEscalationsForPrompt(
+  escalations: ExistingEscalation[],
+): string {
+  return escalations
+    .map(
+      (e, i) =>
+        `[${i + 1}] ID: ${e.id} | Status: ${e.status} | Priority: ${e.priority} | Issue: "${e.guestRequest}" | Summary: "${e.conciergeSummary}"`,
+    )
+    .join('\n');
+}
+
+// --- Interfaces -------------------------------------------------------------
+
+
+export interface ExistingEscalation {
+  id: string;
+  guestRequest: string;
+  conciergeSummary: string;
+  status: 'open' | 'resolved' | string;
+  priority: '1' | '2' | '3' | string;
+  createdAt?: string;
+}
+
+export interface ExistingEscalationsResponse {
+  escalations?: ExistingEscalation[];
+}
+
+export interface SimilarityResult {
+  isSimilar: boolean;
+  matchedEscalationId: string | null;
+  confidence?: 'high' | 'medium' | 'low' | string;
+  reasoning?: string;
+}
 interface ContactStaffToolResult {
   status: 'escalated';
   messageFromStaff: 'Not confirmed. Need to review.';
   note?: string;
+}
+
+interface EscalationUpdatedResult {
+  status: 'updated';
+  escalationId: string;
+  message: string;
+  priorityUpgraded?: boolean;
+}
+
+interface EscalationSkippedResult {
+  status: 'skipped';
+  escalationId: string;
+  message: string;
 }
 
 interface IncidentResponse {
@@ -200,3 +578,10 @@ interface IncidentResponse {
 interface EscalationFailedResponse {
   failed: true;
 }
+
+interface EscalationUpdatePayload {
+  conciergeSummary?: string;
+  priority?: '1' | '2' | '3';
+  guestRequest?: string;
+}
+
