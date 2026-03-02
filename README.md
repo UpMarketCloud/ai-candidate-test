@@ -385,3 +385,60 @@ it('creates a new escalation when no existing ones match', async () => {
 ## Questions?
 
 If anything is unclear, document your assumptions in the README and proceed. We want to see how you handle ambiguity.
+
+---
+
+## Candidate Solution Notes
+
+## Change Log
+
+### 2026-03-02
+
+- Implemented escalation-aware decision flow in `ContactStaffTool`:
+  - fetch existing escalations before acting
+  - similarity-based match routing
+  - open match: `skipped` vs `updated`
+  - resolved match: recurring `reopened` escalation with priority elevation
+- Added one-shot similarity retry when checker returns a `matchedEscalationId` not present in fetched escalations.
+- Expanded tool response semantics (`escalated`, `updated`, `skipped`, `reopened`, `failed`) for clearer agent messaging.
+- Added and updated unit tests to cover decision branches and failure paths.
+- Added prompt/data formatting alignment so similarity comparison includes escalation summary context.
+- Documented scenario decisions, trade-offs, and similarity behavior in the README.
+
+### Decision Table (Implemented)
+
+| Scenario | Behavior |
+|----------|----------|
+| No existing escalations | Create a new escalation (`status: "escalated"`). |
+| Existing **open** escalation about the **same issue** | If no meaningful new details and no priority increase, skip duplicate update (`status: "skipped"`). Otherwise update the existing escalation (`status: "updated"`). |
+| Existing **resolved** escalation about the **same issue** | Treat as recurring issue, create a new escalation, and elevate priority by one level when possible (`status: "reopened"`). |
+| Existing escalation about a **different issue** | Create a new escalation (`status: "escalated"`). |
+| Guest adds new details to an already-escalated issue | Update the existing open escalation and append new context (`status: "updated"`). |
+| Priority of the new request is higher than existing escalation | Update matched open escalation priority and return `priorityUpgraded: true`. |
+| Fetch-existing-escalations API call fails | Graceful degradation: log error and create a new escalation. |
+| Similarity returns an ID not present in fetched escalations | Retry similarity once with an invalid-ID hint; if still invalid, fall back to creating a new escalation. |
+
+### Similarity Detection
+
+- A similarity prompt template is defined in code (`SIMILARITY_PROMPT_TEMPLATE`).
+- The prompt compares the new guest query against existing escalation issue + summary context.
+- Similarity evaluation is invoked through the `SimilarityChecker` interface.
+- If similarity returns a non-existent escalation ID, the tool performs one retry with `invalidMatchedEscalationId` to reduce bad-ID matches.
+- In unit tests, similarity is mocked to keep tests deterministic and avoid real LLM calls.
+
+### Tool Response Design
+
+The tool now returns richer outcomes for the agent:
+
+- `escalated`: a new escalation was created
+- `updated`: an existing escalation was updated
+- `skipped`: duplicate follow-up with no new actionable info
+- `reopened`: recurring issue after a resolved escalation
+- `failed`: escalation service unavailable after retries
+
+### Assumptions / Trade-offs
+
+- Duplicate follow-ups should not spam staff; skip is preferred when no new detail is provided.
+- Recurring issues should be surfaced with higher urgency to reduce repeat guest impact.
+- If fetch/update fails, favor continuity for guest support over strict deduplication.
+- Similarity retry is intentionally capped at one attempt to avoid loops and keep latency predictable.
